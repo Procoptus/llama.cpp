@@ -1814,12 +1814,47 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static __global__ void k_simple_gemm_f32(int n, int nx, const float * x, const float * y, float * z, size_t nb01, size_t nb11) {
+    int ix = blockIdx.x;
+    int iy = blockIdx.y;
+    x += nb01 * ix;
+    y += nb11 * iy;
+    float sum = 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sum += x[j]*y[j];
+    }
+    sum = warp_reduce_sum(sum);
+    __shared__ float tmp[32];
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    if (lane_id == 0) tmp[warp_id] = sum;
+    __syncthreads();
+    sum = tmp[lane_id];
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        z[iy*nx + ix] = sum;
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
+    }
+
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[0] >= 1024 && src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1 && src1->ne[1] <= 8 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        ggml_cuda_info().devices[ctx.device].warp_size == WARP_SIZE) {
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        if (src0->ne[1] * src1->ne[1] <= nsm) {
+            dim3 grid(src0->ne[1], src1->ne[1], 1);
+            k_simple_gemm_f32<<<grid, 1024, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const float *)src0->data, (const float *)src1->data, (float *)dst->data,
+                    src0->nb[1]/sizeof(float), src1->nb[1]/sizeof(float));
+            return;
+        }
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
