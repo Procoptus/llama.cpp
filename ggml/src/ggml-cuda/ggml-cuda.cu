@@ -3150,6 +3150,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> rms_norm_mul_add_rms_norm_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM };
+
+    if (ops.size() == 4 && is_equal(rms_norm_mul_add_rms_norm_ops, ops) &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, rms_norm_mul_add_rms_norm_ops, { node_idx + 2, node_idx + 3 })) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * rms2     = cgraph->nodes[node_idx + 3];
+
+        // mul/add operands may sit in either src slot, rms2 input is always src[0]
+        if ((mul->src[0] != rms_norm && mul->src[1] != rms_norm) ||
+            (add->src[0] != mul && add->src[1] != mul) || rms2->src[0] != add) {
+            return false;
+        }
+
+        if (!ggml_are_same_shape(mul, rms_norm) || !ggml_are_same_shape(add, rms_norm) ||
+            !ggml_are_same_shape(rms2, rms_norm)) {
+            return false;
+        }
+
+        const ggml_tensor * mul_w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor * add_b = add->src[0] == mul      ? add->src[1] : add->src[0];
+
+        // rms_norm has no scale operand in this fork, do not silently drop one
+        if (rms2->src[1] != nullptr) {
+            return false;
+        }
+
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || rms2->type != GGML_TYPE_F32 ||
+            mul_w->type != GGML_TYPE_F32 || add_b->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // kernel reads operand rows contiguously and writes both outputs fully packed
+        if (!ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous_rows(mul_w) ||
+            !ggml_is_contiguous_rows(add_b) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(rms2)) {
+            return false;
+        }
+
+        int out_nodes[] = { node_idx + 2, node_idx + 3 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 2);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4012,6 +4057,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM }, {})) {
+        ggml_cuda_op_rms_norm_mul_add_rms(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
