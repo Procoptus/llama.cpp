@@ -88,6 +88,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // ncols2=4 divides gqa 12 exactly, ncols2=8 does not:
+    if (use_gqa_opt && DKQ == 256 && gqa_ratio == 12 && Q->ne[1] > 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        return;
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
