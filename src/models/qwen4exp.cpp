@@ -430,7 +430,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (cell_blk) {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -450,12 +452,16 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
-        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+
+        // the score inputs are absent when the cache fits the top-k budget, see build_qsa_top_k
+        if (cell_blk) {
+            res &= cell_blk->ne[0]  == n_kv;
+            res &= cell_blk->ne[1]  == n_stream;
+            res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+            res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+            res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        }
 
         return res;
     }
@@ -492,6 +498,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const int64_t n_blocks = (n_kv + r - 1)/r;
 
+    // when the whole cache fits the top-k budget the cut keeps every cell, so skip the scoring and attend densely
+    const bool fits_top_k = n_kv <= (int64_t) hparams.indexer_top_k;
+
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();
     GGML_ASSERT(n_tokens % n_stream == 0);
@@ -514,16 +523,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        if (!fits_top_k) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+
+            ggml_set_input(qsa->cell_blk);
+            ggml_set_input(qsa->blk_cells);
+            ggml_set_input(qsa->blk_pos);
+            ggml_set_input(qsa->bias);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -536,6 +548,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+
+    // keys must still reach the indexer cache on every step, only the scores are skipped
+    if (fits_top_k) {
+        return nullptr;
+    }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
