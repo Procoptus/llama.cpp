@@ -2519,7 +2519,23 @@ ggml_status llama_context::graph_compute(
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
-            ggml_format_name(cur, "%s-%d", name, il);
+            int j = 0;
+            for (; j < GGML_MAX_NAME - 1 && name[j] != '\0'; ++j) {
+                cur->name[j] = name[j];
+            }
+            if (j < GGML_MAX_NAME - 1) {
+                cur->name[j++] = '-';
+                char buf[16];
+                int n = 0;
+                do {
+                    buf[n++] = '0' + il % 10;
+                    il /= 10;
+                } while (il > 0);
+                while (n > 0 && j < GGML_MAX_NAME - 1) {
+                    cur->name[j++] = buf[--n];
+                }
+            }
+            cur->name[j] = '\0';
         } else {
             ggml_set_name(cur, name);
         }
